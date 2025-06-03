@@ -4,14 +4,17 @@ using SharpPcap.LibPcap;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using Spectre.Console;
 
 namespace ConsoleClient
 {
 	public class Program
 	{
 		private static int packetCount = 0; // Counter for captured packets
-		private static readonly int maxPackets = 10; // Maximum packets to capture
 		private static bool stopCapture = false; // Flag to stop capturing
+		private static Table packetTable;
+		private static readonly int maxRows = 20; // Clearr table after 20 packets
+
 		static void Main(string[] args)
 		{
 			Console.WriteLine("Packet Sniffer: Setting up SharpPcap...");
@@ -19,7 +22,20 @@ namespace ConsoleClient
 
 			try
 			{
-				// Get all network interfaces
+				// Initialize table
+				packetTable = new Table()
+					.AddColumn("Packet #")
+					.AddColumn("Timestamp")
+					.AddColumn("Src MAC")
+					.AddColumn("Dst MAC")
+					.AddColumn("Src IP")
+					.AddColumn("Dst IP")
+					.AddColumn("Protocol")
+					.AddColumn("Transport Details");
+
+
+
+				// Get all network interfaces that can be used for packet capture
 				var devices = CaptureDeviceList.Instance;
 
 				if (devices.Count == 0)
@@ -53,14 +69,33 @@ namespace ConsoleClient
 
 				// Prompt user to select an interface
 				Console.WriteLine("\nEnter the index of the interface to use (e.g., 0, 1, ...):");
-				string input = Console.ReadLine();
+				string? input = Console.ReadLine();
 				if (!int.TryParse(input, out int index) || index < 0 || index >= devices.Count)
 				{
 					Console.WriteLine("Invalid index. Please run again and enter a valid number.");
 					return;
 				}
 
+				// Prompt user to select a protocol
+				Console.WriteLine("\nSelect a protocol to filter (TCP, UDP, ICMP):");
+				string? protocolInput = Console.ReadLine()?.ToUpper();
+				// Here we transform the user input to the expected format for the BPF filter.
+				string? bpfFilter = protocolInput switch
+				{
+					"TCP" => "ip proto 6", // TCP protocol number
+					"UDP" => "ip proto 17", // UDP protocol number
+					"ICMP" => "ip proto 1", // ICMP protocol number
+					_ => null // No filter
+				};
+
+				if (bpfFilter == null)
+				{
+					Console.WriteLine("Invalid protocol. Please choose TCP, UDP, or ICMP.");
+					return;
+				}
+
 				// Select the device based on user input
+				// We need to cast because not all ICaptureDevice can be used for live capture
 				var selectedDevice = devices[index] as LibPcapLiveDevice; // Cast to LibPcapLiveDevice for packet capture
 				if (selectedDevice == null)
 				{
@@ -70,31 +105,53 @@ namespace ConsoleClient
 
 				// Open in promiscuous mode, 65536 max packet size, 1000ms timeout
 				selectedDevice.Open(DeviceModes.Promiscuous, 1000);
+
+				// Set the BPF filter for the selected protocol
+				try
+				{
+					selectedDevice.Filter = bpfFilter;
+					Console.WriteLine($"Filter applied: {bpfFilter}");
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"Failed to set filter: {ex.Message}");
+					selectedDevice.Close();
+					return;
+				}
+
 				Console.WriteLine($"Opened: {selectedDevice.Description} ({selectedDevice.Name})");
-				Console.WriteLine("Capturing packets... PPress 'Q' to stop (max 10 packets).");
+				Console.WriteLine($"Capturing {protocolInput} packets... Press 'Q' to stop.");
 
 				// Register packet arrival handler
-				// This executes when a packet is captured by the device more efficient than polling
+				// This executes when a packet is captured by the device more efficient than polling the device
+				// This will run in the new thread we created below since the .Capture() method is assigned in the new thread
 				selectedDevice.OnPacketArrival += Device_OnPacketArrival;
 
 				// Start capture in a aseparate thread so we can handle user input concurrently
 				Thread captureThread = new Thread(() => selectedDevice.Capture());
 				captureThread.Start();
 
-				// Check for 'Q' key to stop capture
-				while (!stopCapture)
-				{
-					if (Console.KeyAvailable)
+				// Display table and check for 'Q' key to stop capture
+				AnsiConsole.Live(packetTable)
+					.Start(ctx =>
 					{
-						var key = Console.ReadKey(true).KeyChar;
-						if (char.ToUpper(key) == 'Q')
+						while (!stopCapture)
 						{
-							stopCapture = true;
-							selectedDevice.StopCapture();
+							if (Console.KeyAvailable)
+							{
+								var key = Console.ReadKey(true).KeyChar;
+								if (char.ToUpper(key) == 'Q')
+								{
+									stopCapture = true;
+									selectedDevice.StopCapture();
+									Console.WriteLine("\nCapture stopped.");
+								}
+							}
+							ctx.Refresh(); // Refresh the table display
+							Thread.Sleep(100); // Prevent CPU overuse
 						}
-					}
-					Thread.Sleep(100); // Prevent CPU overuse
-				}
+					});
+
 
 				// Wait for capture thread to finish
 				captureThread.Join();
@@ -114,48 +171,109 @@ namespace ConsoleClient
 
 		private static void Device_OnPacketArrival(object sender, PacketCapture e)
 		{
-			if (stopCapture || packetCount >= maxPackets)
+			if (stopCapture)
 			{
-				if (sender is LibPcapLiveDevice device)
-				{
-					device.StopCapture();
-				}
 				return;
 			}
 
-			// Convert PacketCapture to RawCapture
+			// Convert PacketCapture to RawCapture so we can access the raw packet data
 			var rawPacket = e.GetPacket();
 			packetCount++;
 
-			Console.WriteLine($"\nPacket #{packetCount}:");
-			Console.WriteLine($"Timestamp: {rawPacket.Timeval.Date}");
-			Console.WriteLine($"Length: {rawPacket.Data.Length} bytes");
+			// Clear table if too many rows
+			lock (packetTable)
+			{
+				if (packetTable.Rows.Count >= maxRows)
+				{
+					packetTable.Rows.Clear();
+				}
+			}
+
 
 			// Parse the packet with PacketDotNet
 			var parsedPacket = Packet.ParsePacket(rawPacket.LinkLayerType, rawPacket.Data);
 			if (parsedPacket is EthernetPacket ethernetPacket)
 			{
-				Console.WriteLine("Ethernet Header:");
-				Console.WriteLine($"  Source MAC: {ethernetPacket.SourceHardwareAddress}");
-				Console.WriteLine($"  Destination MAC: {ethernetPacket.DestinationHardwareAddress}");
-				Console.WriteLine($"  EtherType: {ethernetPacket.Type}");
+				string srcMac = ethernetPacket.SourceHardwareAddress.ToString();
+				string dstMac = ethernetPacket.DestinationHardwareAddress.ToString();
 
 				// Check for IPv4 payload
 				if (ethernetPacket.PayloadPacket is IPPacket ipPacket && ipPacket.Version == IPVersion.IPv4)
 				{
-					Console.WriteLine("IPv4 Header:");
-					Console.WriteLine($"  Source IP: {ipPacket.SourceAddress}");
-					Console.WriteLine($"  Destination IP: {ipPacket.DestinationAddress}");
-					Console.WriteLine($"  Protocol: {ipPacket.Protocol}");
+					string srcIp = ipPacket.SourceAddress.ToString();
+					string dstIp = ipPacket.DestinationAddress.ToString();
+					string protocol = ipPacket.Protocol.ToString();
+					string transportDetails = string.Empty;
+
+					// Parse transport layer based on protocol
+					if (ipPacket.PayloadPacket is TcpPacket tcpPacket)
+					{
+						transportDetails = $"Ports: {tcpPacket.SourcePort}->{tcpPacket.DestinationPort}, Flags: {(tcpPacket.Synchronize ? "SYN " : "")}" +
+							$"{(tcpPacket.Acknowledgment ? "ACK " : "")}{(tcpPacket.Finished ? "FIN " : "")}".Trim();
+					}
+					else if (ipPacket.PayloadPacket is UdpPacket udpPacket)
+					{
+						transportDetails = $"Ports: {udpPacket.SourcePort}->{udpPacket.DestinationPort}";
+					}
+					else if (ipPacket.PayloadPacket is IcmpV4Packet icmpPacket)
+					{
+						transportDetails = $"Type Code: {icmpPacket.TypeCode}";
+					}
+					else
+					{
+						transportDetails = $"Unexpected: {ipPacket.Protocol}";
+					}
+
+					// Add row to table
+					lock (packetTable)
+					{
+						packetTable.AddRow(
+							packetCount.ToString(),
+							rawPacket.Timeval.Date.ToString("HH:mm:ss.fff"),
+							srcMac,
+							dstMac,
+							srcIp,
+							dstIp,
+							protocol,
+							transportDetails
+						);
+					}
+
 				}
 				else
 				{
-					Console.WriteLine("Not an IPv4 packet (e.g., IPv6, ARP).");
+					// Add row for non-IPv4 packet
+					lock (packetTable)
+					{
+						packetTable.AddRow(
+							packetCount.ToString(),
+							rawPacket.Timeval.Date.ToString("HH:mm:ss.fff"),
+							srcMac,
+							dstMac,
+							"-",
+							"-",
+							"-",
+							"Non-IPv4 Packet"
+							);
+					}
 				}
 			}
 			else
 			{
-				Console.WriteLine("Not an thernet packet.");
+				// Add row for non-Ethernet packet
+				lock (packetTable)
+				{
+					packetTable.AddRow(
+						packetCount.ToString(),
+						rawPacket.Timeval.Date.ToString("HH:mm:ss.fff"),
+						"-",
+						"-",
+						"-",
+						"-",
+						"-",
+						"Non-Ethernet Packet"
+					);
+				}
 			}
 		}
 	}
