@@ -76,22 +76,13 @@ namespace ConsoleClient
 					return;
 				}
 
-				// Prompt user to select a protocol
-				Console.WriteLine("\nSelect a protocol to filter (TCP, UDP, ICMP):");
-				string? protocolInput = Console.ReadLine()?.ToUpper();
-				// Here we transform the user input to the expected format for the BPF filter.
-				string? bpfFilter = protocolInput switch
+				// Prompt user for BPF filter
+				Console.WriteLine("\nEnter a BPF filter (e.g., 'tcp port 80', 'udp', 'icmp and src 192.168.1.48') or press Enter for none:");
+				Console.WriteLine("Examples: 'tcp port 80 (HTTP), 'udp port 53' (DNS), 'ip proto 1' (ICMP)");
+				string? bpfFilter = Console.ReadLine()?.Trim();
+				if (string.IsNullOrEmpty(bpfFilter))
 				{
-					"TCP" => "ip proto 6", // TCP protocol number
-					"UDP" => "ip proto 17", // UDP protocol number
-					"ICMP" => "ip proto 1", // ICMP protocol number
-					_ => null // No filter
-				};
-
-				if (bpfFilter == null)
-				{
-					Console.WriteLine("Invalid protocol. Please choose TCP, UDP, or ICMP.");
-					return;
+					bpfFilter = ""; // No filter, capture all packets
 				}
 
 				// Select the device based on user input
@@ -106,21 +97,28 @@ namespace ConsoleClient
 				// Open in promiscuous mode, 65536 max packet size, 1000ms timeout
 				selectedDevice.Open(DeviceModes.Promiscuous, 1000);
 
-				// Set the BPF filter for the selected protocol
-				try
+				// Set the BPF filter if provided
+				if (!string.IsNullOrEmpty(bpfFilter))
 				{
-					selectedDevice.Filter = bpfFilter;
-					Console.WriteLine($"Filter applied: {bpfFilter}");
+					try
+					{
+						selectedDevice.Filter = bpfFilter; // Set the BPF filter
+						Console.WriteLine($"Filter applied: {bpfFilter}");
+					}
+					catch (Exception ex)
+					{
+						Console.WriteLine($"Failed to set filter: {ex.Message}");
+						selectedDevice.Close();
+						return;
+					} 
 				}
-				catch (Exception ex)
+				else
 				{
-					Console.WriteLine($"Failed to set filter: {ex.Message}");
-					selectedDevice.Close();
-					return;
+					Console.WriteLine("No filter applied, capturing all packets.");
 				}
 
 				Console.WriteLine($"Opened: {selectedDevice.Description} ({selectedDevice.Name})");
-				Console.WriteLine($"Capturing {protocolInput} packets... Press 'Q' to stop.");
+				Console.WriteLine("Capturing packets... Press 'Q' to stop.");
 
 				// Register packet arrival handler
 				// This executes when a packet is captured by the device more efficient than polling the device
